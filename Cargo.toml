@@ -15,6 +15,9 @@ base64 = "0.21"
 anyhow = "1.0"
 url = "2.5"
 serde = { version = "1.0", features = ["derive"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
 chromiumoxide = "0.9"
 futures = "0.3"
 
