@@ -1,9 +1,18 @@
-use axum::{extract::Query, http::StatusCode, response::IntoResponse, routing::get, Router};
+use axum::{
+    extract::{Query, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    routing::get,
+    Router,
+};
 use base64::{engine::general_purpose::URL_SAFE, Engine};
-use dioxus_native::Config;
+use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::page::ScreenshotParams;
+use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
+use chromiumoxide::cdp::browser_protocol::page::CaptureScreenshotFormat;
+use futures::StreamExt;
 use serde::Deserialize;
-use std::{net::SocketAddr, time::Instant};
-use tokio::task::block_in_place;
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 use tower_http::trace::TraceLayer;
 use tracing::{info, Level};
 use url::Url;
@@ -26,45 +35,76 @@ fn validate_url(url_str: &str) -> Result<Url, String> {
     Url::parse(url_str).map_err(|_| "Invalid URL".to_string())
 }
 
-async fn render_html(url: &Url, _width: u32, _height: u32) -> Result<Vec<u8>, String> {
-    let html_content = reqwest::blocking::get(url.as_str())
-        .and_then(|response| response.text())
-        .map_err(|e| format!("Failed to fetch URL: {}", e))?;
+async fn render_screenshot(browser: &Browser, url: &Url, width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let page = browser
+        .new_page("about:blank")
+        .await
+        .map_err(|e| format!("Failed to create page: {}", e))?;
 
-    let config = Config {
-        stylesheets: Vec::new(),
-        base_url: Some(url.to_string()),
-    };
+    // Set viewport dimensions
+    let viewport = SetDeviceMetricsOverrideParams::new(width, height, 1.0, false);
+    page.execute(viewport)
+        .await
+        .map_err(|e| format!("Failed to set viewport: {}", e))?;
 
-    tokio::task::spawn_blocking(move || {
-        dioxus_native::launch_static_html_cfg(&html_content, config);
-        Ok(Vec::new())
-    })
-    .await
-    .map_err(|e| format!("Task failed: {}", e))?
+    // Navigate and wait for page load
+    page.goto(url.as_str())
+        .await
+        .map_err(|e| format!("Failed to navigate: {}", e))?;
+
+    // Take screenshot
+    let png_data = page
+        .screenshot(
+            ScreenshotParams::builder()
+                .format(CaptureScreenshotFormat::Png)
+                .build(),
+        )
+        .await
+        .map_err(|e| format!("Screenshot failed: {}", e))?;
+
+    // Close the page
+    let _ = page.close().await;
+
+    Ok(png_data)
 }
 
-async fn render_url(Query(params): Query<RenderParams>) -> impl IntoResponse {
+async fn render_url(
+    State(browser): State<Arc<Browser>>,
+    Query(params): Query<RenderParams>,
+) -> impl IntoResponse {
     let start = Instant::now();
 
-    let result = decode_base64_url(&params.url)
-        .and_then(|decoded| validate_url(&decoded))
-        .and_then(|url| {
-            info!("Starting render for URL: {}", url);
+    let decoded = match decode_base64_url(&params.url) {
+        Ok(d) => d,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
 
-            let result = block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(render_html(&url, params.w, params.h))
-            });
+    let url = match validate_url(&decoded) {
+        Ok(u) => u,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
 
+    info!("Starting render for URL: {} ({}x{})", url, params.w, params.h);
+
+    match render_screenshot(&browser, &url, params.w, params.h).await {
+        Ok(png_data) => {
             let total_time = start.elapsed();
-            info!("Render completed - Total time: {:?}", total_time);
-
-            result
-        });
-
-    match result {
-        Ok(png_data) => (StatusCode::OK, png_data).into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
+            info!(
+                "Render completed - {} bytes, took {:?}",
+                png_data.len(),
+                total_time
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/png")
+                .body(axum::body::Body::from(png_data))
+                .unwrap()
+                .into_response()
+        }
+        Err(error) => {
+            info!("Render failed: {}", error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
+        }
     }
 }
 
@@ -80,10 +120,35 @@ async fn main() {
         .with_max_level(Level::INFO)
         .init();
 
+    info!("Launching headless Chrome...");
+    let (browser, mut handler) = Browser::launch(
+        BrowserConfig::builder()
+            .no_sandbox()
+            .arg("--disable-gpu")
+            .arg("--disable-dev-shm-usage")
+            .build()
+            .expect("Failed to build browser config"),
+    )
+    .await
+    .expect("Failed to launch Chrome");
+
+    // Spawn the browser event handler
+    tokio::spawn(async move {
+        while let Some(h) = handler.next().await {
+            if h.is_err() {
+                break;
+            }
+        }
+    });
+
+    let browser = Arc::new(browser);
+    info!("Chrome launched successfully");
+
     let app = Router::new()
         .route("/render.png", get(render_url))
         .route("/health", get(health_check))
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .with_state(browser);
 
     info!("Starting server on port 3000");
 
