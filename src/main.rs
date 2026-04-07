@@ -14,7 +14,8 @@ use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
-use std::{env, net::SocketAddr, sync::Arc, time::Instant};
+use std::{env, io::Cursor, net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
+use tokio::fs;
 use tower_http::trace::TraceLayer;
 use tracing::{info, Level};
 use url::Url;
@@ -24,30 +25,109 @@ struct AppState {
     signing_key: Option<String>,
 }
 
+// --- Shared param types ---
+
 #[derive(Debug, Deserialize, PartialEq)]
 struct RenderParams {
     url: String,
     w: u32,
     h: u32,
     verify: Option<String>,
+    cache: Option<u64>,
 }
 
-fn verify_signature(params: &RenderParams, signing_key: &str) -> Result<(), String> {
-    let sig = params.verify.as_deref().ok_or("Missing verify parameter")?;
+#[derive(Debug, Deserialize, PartialEq)]
+struct AnimateParams {
+    url: String,
+    w: u32,
+    h: u32,
+    duration: Option<f32>,
+    fps: Option<u32>,
+    verify: Option<String>,
+    cache: Option<u64>,
+}
 
-    // Build canonical query string from sorted non-verify params
-    let canonical = format!("h={}&url={}&w={}", params.h, params.url, params.w);
+// --- Signature verification ---
 
+fn compute_signature(canonical: &str, signing_key: &str) -> Result<String, String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(signing_key.as_bytes())
         .map_err(|_| "Invalid signing key".to_string())?;
     mac.update(canonical.as_bytes());
-    let expected = hex::encode(mac.finalize().into_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
 
+fn verify_render_signature(params: &RenderParams, signing_key: &str) -> Result<(), String> {
+    let sig = params.verify.as_deref().ok_or("Missing verify parameter")?;
+    let mut parts = vec![
+        format!("h={}", params.h),
+        format!("url={}", params.url),
+        format!("w={}", params.w),
+    ];
+    if let Some(cache) = params.cache {
+        parts.push(format!("cache={}", cache));
+        parts.sort();
+    }
+    let canonical = parts.join("&");
+    let expected = compute_signature(&canonical, signing_key)?;
     if sig != expected {
         return Err("Invalid signature".to_string());
     }
     Ok(())
 }
+
+fn verify_animate_signature(params: &AnimateParams, signing_key: &str) -> Result<(), String> {
+    let sig = params.verify.as_deref().ok_or("Missing verify parameter")?;
+    let mut parts = vec![
+        format!("h={}", params.h),
+        format!("url={}", params.url),
+        format!("w={}", params.w),
+    ];
+    if let Some(duration) = params.duration {
+        parts.push(format!("duration={}", duration));
+    }
+    if let Some(fps) = params.fps {
+        parts.push(format!("fps={}", fps));
+    }
+    if let Some(cache) = params.cache {
+        parts.push(format!("cache={}", cache));
+    }
+    parts.sort();
+    let canonical = parts.join("&");
+    let expected = compute_signature(&canonical, signing_key)?;
+    if sig != expected {
+        return Err("Invalid signature".to_string());
+    }
+    Ok(())
+}
+
+// --- Caching ---
+
+fn cache_path(canonical: &str, ttl: u64, ext: &str) -> PathBuf {
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"cache-key").unwrap();
+    mac.update(canonical.as_bytes());
+    let hash = hex::encode(mac.finalize().into_bytes());
+    PathBuf::from(format!("/tmp/{}-{}.{}", ttl, &hash[..16], ext))
+}
+
+async fn try_cache_read(path: &PathBuf) -> Option<Vec<u8>> {
+    let metadata = fs::metadata(path).await.ok()?;
+    let modified = metadata.modified().ok()?;
+    let age = modified.elapsed().ok()?;
+
+    // Extract TTL from filename: /tmp/{TTL}-{hash}.ext
+    let filename = path.file_name()?.to_str()?;
+    let ttl_str = filename.split('-').next()?;
+    let ttl: u64 = ttl_str.parse().ok()?;
+
+    if age.as_secs() < ttl {
+        fs::read(path).await.ok()
+    } else {
+        let _ = fs::remove_file(path).await;
+        None
+    }
+}
+
+// --- URL helpers ---
 
 fn decode_base64_url(encoded: &str) -> Result<String, String> {
     URL_SAFE
@@ -60,36 +140,52 @@ fn validate_url(url_str: &str) -> Result<Url, String> {
     Url::parse(url_str).map_err(|_| "Invalid URL".to_string())
 }
 
-async fn render_screenshot(browser: &Browser, url: &Url, width: u32, height: u32) -> Result<Vec<u8>, String> {
+// --- Chrome helpers ---
+
+async fn open_page(
+    browser: &Browser,
+    url: &Url,
+    width: u32,
+    height: u32,
+) -> Result<chromiumoxide::Page, String> {
     let page = browser
         .new_page("about:blank")
         .await
         .map_err(|e| format!("Failed to create page: {}", e))?;
 
-    // Set viewport dimensions
     let viewport = SetDeviceMetricsOverrideParams::new(width, height, 1.0, false);
     page.execute(viewport)
         .await
         .map_err(|e| format!("Failed to set viewport: {}", e))?;
 
-    // Navigate and wait for page load
     page.goto(url.as_str())
         .await
         .map_err(|e| format!("Failed to navigate: {}", e))?;
 
-    // Take screenshot
-    let png_data = page
-        .screenshot(
-            ScreenshotParams::builder()
-                .format(CaptureScreenshotFormat::Png)
-                .build(),
-        )
-        .await
-        .map_err(|e| format!("Screenshot failed: {}", e))?;
+    Ok(page)
+}
 
-    // Close the page
+async fn capture_frame(page: &chromiumoxide::Page) -> Result<Vec<u8>, String> {
+    page.screenshot(
+        ScreenshotParams::builder()
+            .format(CaptureScreenshotFormat::Png)
+            .build(),
+    )
+    .await
+    .map_err(|e| format!("Screenshot failed: {}", e))
+}
+
+// --- Screenshot endpoint ---
+
+async fn render_screenshot(
+    browser: &Browser,
+    url: &Url,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, String> {
+    let page = open_page(browser, url, width, height).await?;
+    let png_data = capture_frame(&page).await?;
     let _ = page.close().await;
-
     Ok(png_data)
 }
 
@@ -99,9 +195,8 @@ async fn render_url(
 ) -> impl IntoResponse {
     let start = Instant::now();
 
-    // Verify signature if SIGNING_KEY is set
     if let Some(ref key) = state.signing_key {
-        if let Err(e) = verify_signature(&params, key) {
+        if let Err(e) = verify_render_signature(&params, key) {
             return (StatusCode::UNAUTHORIZED, e).into_response();
         }
     }
@@ -116,16 +211,35 @@ async fn render_url(
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
     };
 
+    // Check cache
+    let cache_file = params.cache.map(|ttl| {
+        let canonical = format!("h={}&url={}&w={}", params.h, params.url, params.w);
+        cache_path(&canonical, ttl, "png")
+    });
+    if let Some(ref path) = cache_file {
+        if let Some(data) = try_cache_read(path).await {
+            info!("Cache hit for URL: {}", url);
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/png")
+                .body(axum::body::Body::from(data))
+                .unwrap()
+                .into_response();
+        }
+    }
+
     info!("Starting render for URL: {} ({}x{})", url, params.w, params.h);
 
     match render_screenshot(&state.browser, &url, params.w, params.h).await {
         Ok(png_data) => {
             let total_time = start.elapsed();
-            info!(
-                "Render completed - {} bytes, took {:?}",
-                png_data.len(),
-                total_time
-            );
+            info!("Render completed - {} bytes, took {:?}", png_data.len(), total_time);
+
+            // Write cache
+            if let Some(ref path) = cache_file {
+                let _ = fs::write(path, &png_data).await;
+            }
+
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "image/png")
@@ -140,9 +254,189 @@ async fn render_url(
     }
 }
 
+// --- Animation endpoint ---
+
+fn decode_png_to_rgba(png_bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
+    let decoder = png::Decoder::new(Cursor::new(png_bytes));
+    let mut reader = decoder.read_info().map_err(|e| format!("PNG decode error: {}", e))?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| format!("PNG frame error: {}", e))?;
+
+    let width = info.width;
+    let height = info.height;
+
+    // Convert to RGBA if needed
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => buf[..info.buffer_size()].to_vec(),
+        png::ColorType::Rgb => {
+            let rgb = &buf[..info.buffer_size()];
+            let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+            for pixel in rgb.chunks(3) {
+                rgba.extend_from_slice(pixel);
+                rgba.push(255);
+            }
+            rgba
+        }
+        other => return Err(format!("Unsupported color type: {:?}", other)),
+    };
+
+    Ok((width, height, rgba))
+}
+
+fn encode_apng(frames: &[(u32, u32, Vec<u8>)], fps: u32) -> Result<Vec<u8>, String> {
+    if frames.is_empty() {
+        return Err("No frames to encode".to_string());
+    }
+
+    let (width, height, _) = &frames[0];
+    let mut output = Vec::new();
+
+    {
+        let mut encoder = png::Encoder::new(&mut output, *width, *height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .set_animated(frames.len() as u32, 0)
+            .map_err(|e| format!("APNG setup error: {}", e))?;
+
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| format!("APNG header error: {}", e))?;
+
+        for (_, _, rgba) in frames {
+            writer
+                .set_frame_delay(1, fps as u16)
+                .map_err(|e| format!("Frame delay error: {}", e))?;
+            writer
+                .write_image_data(rgba)
+                .map_err(|e| format!("Frame write error: {}", e))?;
+        }
+    }
+
+    Ok(output)
+}
+
+async fn render_animation(
+    browser: &Browser,
+    url: &Url,
+    width: u32,
+    height: u32,
+    duration: f32,
+    fps: u32,
+) -> Result<Vec<u8>, String> {
+    let page = open_page(browser, url, width, height).await?;
+
+    let total_frames = (duration * fps as f32).ceil() as u32;
+    let frame_interval = std::time::Duration::from_millis((1000 / fps) as u64);
+
+    info!("Capturing {} frames at {} fps over {}s", total_frames, fps, duration);
+
+    let mut frames = Vec::with_capacity(total_frames as usize);
+    for i in 0..total_frames {
+        let frame_start = Instant::now();
+        let png_bytes = capture_frame(&page).await?;
+        let (w, h, rgba) = decode_png_to_rgba(&png_bytes)?;
+        frames.push((w, h, rgba));
+
+        if i < total_frames - 1 {
+            let elapsed = frame_start.elapsed();
+            if elapsed < frame_interval {
+                tokio::time::sleep(frame_interval - elapsed).await;
+            }
+        }
+    }
+
+    let _ = page.close().await;
+
+    encode_apng(&frames, fps)
+}
+
+async fn animate_url(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AnimateParams>,
+) -> impl IntoResponse {
+    let start = Instant::now();
+
+    if let Some(ref key) = state.signing_key {
+        if let Err(e) = verify_animate_signature(&params, key) {
+            return (StatusCode::UNAUTHORIZED, e).into_response();
+        }
+    }
+
+    let decoded = match decode_base64_url(&params.url) {
+        Ok(d) => d,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+
+    let url = match validate_url(&decoded) {
+        Ok(u) => u,
+        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    };
+
+    let duration = params.duration.unwrap_or(3.0).min(10.0).max(0.1);
+    let fps = params.fps.unwrap_or(10).min(30).max(1);
+
+    // Check cache
+    let cache_file = params.cache.map(|ttl| {
+        let canonical = format!(
+            "duration={}&fps={}&h={}&url={}&w={}",
+            duration, fps, params.h, params.url, params.w
+        );
+        cache_path(&canonical, ttl, "apng")
+    });
+    if let Some(ref path) = cache_file {
+        if let Some(data) = try_cache_read(path).await {
+            info!("Cache hit for animation: {}", url);
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/apng")
+                .body(axum::body::Body::from(data))
+                .unwrap()
+                .into_response();
+        }
+    }
+
+    info!(
+        "Starting animation for URL: {} ({}x{}, {}s @ {}fps)",
+        url, params.w, params.h, duration, fps
+    );
+
+    match render_animation(&state.browser, &url, params.w, params.h, duration, fps).await {
+        Ok(apng_data) => {
+            let total_time = start.elapsed();
+            info!(
+                "Animation completed - {} bytes, took {:?}",
+                apng_data.len(),
+                total_time
+            );
+
+            if let Some(ref path) = cache_file {
+                let _ = fs::write(path, &apng_data).await;
+            }
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "image/apng")
+                .body(axum::body::Body::from(apng_data))
+                .unwrap()
+                .into_response()
+        }
+        Err(error) => {
+            info!("Animation failed: {}", error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
+        }
+    }
+}
+
+// --- Health check ---
+
 async fn health_check() -> impl IntoResponse {
     (StatusCode::OK, "OK")
 }
+
+// --- Main ---
 
 #[tokio::main]
 async fn main() {
@@ -164,7 +458,6 @@ async fn main() {
     .await
     .expect("Failed to launch Chrome");
 
-    // Spawn the browser event handler
     tokio::spawn(async move {
         while let Some(h) = handler.next().await {
             if h.is_err() {
@@ -188,6 +481,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/render.png", get(render_url))
+        .route("/render.apng", get(animate_url))
         .route("/health", get(health_check))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -239,42 +533,73 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_signature_valid() {
+    fn test_verify_render_signature_valid() {
         let key = "test-secret";
-        // canonical: h=600&url=aHR0cHM6Ly9leGFtcGxlLmNvbQ==&w=800
         let canonical = "h=600&url=aHR0cHM6Ly9leGFtcGxlLmNvbQ==&w=800";
-        let mut mac = Hmac::<Sha256>::new_from_slice(key.as_bytes()).unwrap();
-        mac.update(canonical.as_bytes());
-        let sig = hex::encode(mac.finalize().into_bytes());
+        let sig = compute_signature(canonical, key).unwrap();
 
         let params = RenderParams {
             url: "aHR0cHM6Ly9leGFtcGxlLmNvbQ==".to_string(),
             w: 800,
             h: 600,
             verify: Some(sig),
+            cache: None,
         };
-        assert!(verify_signature(&params, key).is_ok());
+        assert!(verify_render_signature(&params, key).is_ok());
     }
 
     #[test]
-    fn test_verify_signature_invalid() {
+    fn test_verify_render_signature_invalid() {
         let params = RenderParams {
             url: "aHR0cHM6Ly9leGFtcGxlLmNvbQ==".to_string(),
             w: 800,
             h: 600,
             verify: Some("bad-signature".to_string()),
+            cache: None,
         };
-        assert!(verify_signature(&params, "test-secret").is_err());
+        assert!(verify_render_signature(&params, "test-secret").is_err());
     }
 
     #[test]
-    fn test_verify_signature_missing() {
+    fn test_verify_render_signature_missing() {
         let params = RenderParams {
             url: "aHR0cHM6Ly9leGFtcGxlLmNvbQ==".to_string(),
             w: 800,
             h: 600,
             verify: None,
+            cache: None,
         };
-        assert!(verify_signature(&params, "test-secret").is_err());
+        assert!(verify_render_signature(&params, "test-secret").is_err());
+    }
+
+    #[test]
+    fn test_encode_apng_empty() {
+        assert!(encode_apng(&[], 10).is_err());
+    }
+
+    #[test]
+    fn test_encode_apng_single_frame() {
+        // 2x2 red RGBA image
+        let rgba = vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255];
+        let frames = vec![(2, 2, rgba)];
+        let result = encode_apng(&frames, 10);
+        assert!(result.is_ok());
+        let data = result.unwrap();
+        // Should start with PNG magic bytes
+        assert_eq!(&data[..4], &[137, 80, 78, 71]);
+    }
+
+    #[test]
+    fn test_cache_path_deterministic() {
+        let p1 = cache_path("h=600&url=abc&w=800", 300, "png");
+        let p2 = cache_path("h=600&url=abc&w=800", 300, "png");
+        assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn test_cache_path_varies_with_params() {
+        let p1 = cache_path("h=600&url=abc&w=800", 300, "png");
+        let p2 = cache_path("h=600&url=xyz&w=800", 300, "png");
+        assert_ne!(p1, p2);
     }
 }
