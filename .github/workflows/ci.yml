@@ -1,14 +1,15 @@
-name: Rust CI/CD
+name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_VERSION: nightly-2024-03-20  # Updated to a newer nightly that includes rustc 1.79.0
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   test:
@@ -16,77 +17,66 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config \
-            libssl-dev \
-            libgtk-3-dev \
-            libwebkit2gtk-4.0-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            cmake
-      
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: nightly-2024-03-20
           components: rustfmt, clippy
-      
-      - name: Show Rust version
-        run: rustc --version
-      
+
       - name: Cache dependencies
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      
+
       - name: Check formatting
         run: cargo fmt -- --check
-      
+
       - name: Clippy
         run: cargo clippy -- -D warnings
-      
+
       - name: Run tests
         run: cargo test --all-features
 
-  build:
-    name: Build
+  docker:
+    name: Build & Push Docker Image
     needs: test
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config \
-            libssl-dev \
-            libgtk-3-dev \
-            libwebkit2gtk-4.0-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            cmake
-      
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          toolchain: nightly-2024-03-20
-          components: rustfmt, clippy
-      
-      - name: Build
-        run: cargo build --release
-      
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
         with:
-          name: titanium
-          path: target/release/titanium
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha
+            type=raw,value=latest
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

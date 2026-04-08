@@ -228,12 +228,19 @@ async fn render_url(
         }
     }
 
-    info!("Starting render for URL: {} ({}x{})", url, params.w, params.h);
+    info!(
+        "Starting render for URL: {} ({}x{})",
+        url, params.w, params.h
+    );
 
     match render_screenshot(&state.browser, &url, params.w, params.h).await {
         Ok(png_data) => {
             let total_time = start.elapsed();
-            info!("Render completed - {} bytes, took {:?}", png_data.len(), total_time);
+            info!(
+                "Render completed - {} bytes, took {:?}",
+                png_data.len(),
+                total_time
+            );
 
             // Write cache
             if let Some(ref path) = cache_file {
@@ -258,7 +265,9 @@ async fn render_url(
 
 fn decode_png_to_rgba(png_bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
     let decoder = png::Decoder::new(Cursor::new(png_bytes));
-    let mut reader = decoder.read_info().map_err(|e| format!("PNG decode error: {}", e))?;
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("PNG decode error: {}", e))?;
     let mut buf = vec![0u8; reader.output_buffer_size()];
     let info = reader
         .next_frame(&mut buf)
@@ -331,7 +340,10 @@ async fn render_animation(
     let total_frames = (duration * fps as f32).ceil() as u32;
     let frame_interval = std::time::Duration::from_millis((1000 / fps) as u64);
 
-    info!("Capturing {} frames at {} fps over {}s", total_frames, fps, duration);
+    info!(
+        "Capturing {} frames at {} fps over {}s",
+        total_frames, fps, duration
+    );
 
     let mut frames = Vec::with_capacity(total_frames as usize);
     for i in 0..total_frames {
@@ -375,8 +387,8 @@ async fn animate_url(
         Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
     };
 
-    let duration = params.duration.unwrap_or(3.0).min(10.0).max(0.1);
-    let fps = params.fps.unwrap_or(10).min(30).max(1);
+    let duration = params.duration.unwrap_or(3.0).clamp(0.1, 10.0);
+    let fps = params.fps.unwrap_or(10).clamp(1, 30);
 
     // Check cache
     let cache_file = params.cache.map(|ttl| {
@@ -580,7 +592,9 @@ mod tests {
     #[test]
     fn test_encode_apng_single_frame() {
         // 2x2 red RGBA image
-        let rgba = vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255];
+        let rgba = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+        ];
         let frames = vec![(2, 2, rgba)];
         let result = encode_apng(&frames, 10);
         assert!(result.is_ok());
