@@ -505,7 +505,16 @@ async fn animate_url(
 
     let delay_ms = params.delay.unwrap_or(0).min(30000);
 
-    match render_animation(&state.browser, &url, params.w, params.h, duration, fps, delay_ms).await
+    match render_animation(
+        &state.browser,
+        &url,
+        params.w,
+        params.h,
+        duration,
+        fps,
+        delay_ms,
+    )
+    .await
     {
         Ok(apng_data) => {
             let total_time = start.elapsed();
