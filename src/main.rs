@@ -34,6 +34,7 @@ struct RenderParams {
     h: u32,
     verify: Option<String>,
     cache: Option<u64>,
+    delay: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -45,6 +46,7 @@ struct AnimateParams {
     fps: Option<u32>,
     verify: Option<String>,
     cache: Option<u64>,
+    delay: Option<u64>,
 }
 
 // --- Signature verification ---
@@ -65,8 +67,11 @@ fn verify_render_signature(params: &RenderParams, signing_key: &str) -> Result<(
     ];
     if let Some(cache) = params.cache {
         parts.push(format!("cache={}", cache));
-        parts.sort();
     }
+    if let Some(delay) = params.delay {
+        parts.push(format!("delay={}", delay));
+    }
+    parts.sort();
     let canonical = parts.join("&");
     let expected = compute_signature(&canonical, signing_key)?;
     if sig != expected {
@@ -90,6 +95,9 @@ fn verify_animate_signature(params: &AnimateParams, signing_key: &str) -> Result
     }
     if let Some(cache) = params.cache {
         parts.push(format!("cache={}", cache));
+    }
+    if let Some(delay) = params.delay {
+        parts.push(format!("delay={}", delay));
     }
     parts.sort();
     let canonical = parts.join("&");
@@ -147,6 +155,7 @@ async fn open_page(
     url: &Url,
     width: u32,
     height: u32,
+    delay_ms: u64,
 ) -> Result<chromiumoxide::Page, String> {
     let page = browser
         .new_page("about:blank")
@@ -162,7 +171,72 @@ async fn open_page(
         .await
         .map_err(|e| format!("Failed to navigate: {}", e))?;
 
+    // Wait for document.readyState === 'complete' (fires after load event)
+    wait_for_page_ready(&page).await?;
+
+    // Extra delay for JS-heavy pages (charts, animations, etc.)
+    if delay_ms > 0 {
+        info!("Waiting {}ms extra delay", delay_ms);
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+    }
+
     Ok(page)
+}
+
+/// Poll until document.readyState is 'complete' and no in-flight requests,
+/// with a timeout so we don't hang forever on slow pages.
+async fn wait_for_page_ready(page: &chromiumoxide::Page) -> Result<(), String> {
+    let timeout = std::time::Duration::from_secs(30);
+    let poll_interval = std::time::Duration::from_millis(100);
+    let start = Instant::now();
+
+    // Phase 1: wait for document.readyState === 'complete'
+    loop {
+        if start.elapsed() > timeout {
+            info!("Timed out waiting for readyState, proceeding anyway");
+            break;
+        }
+        let ready: String = page
+            .evaluate("document.readyState")
+            .await
+            .map_err(|e| format!("readyState check failed: {}", e))?
+            .into_value()
+            .unwrap_or_default();
+        if ready == "complete" {
+            break;
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    // Phase 2: wait for network idle (no pending fetches for 500ms)
+    // Uses the PerformanceObserver trick to detect outstanding requests
+    let idle_js = r#"
+        new Promise((resolve) => {
+            let timer = null;
+            const reset = () => {
+                clearTimeout(timer);
+                timer = setTimeout(resolve, 500);
+            };
+            reset();
+            const observer = new PerformanceObserver((list) => {
+                reset();
+            });
+            observer.observe({ type: 'resource', buffered: false });
+            // Fallback: resolve after 5s no matter what
+            setTimeout(resolve, 5000);
+        })
+    "#;
+    let idle_timeout = std::time::Duration::from_secs(10);
+    let _ = tokio::time::timeout(idle_timeout, async {
+        let _: Option<bool> = page
+            .evaluate(idle_js)
+            .await
+            .ok()
+            .and_then(|v| v.into_value().ok());
+    })
+    .await;
+
+    Ok(())
 }
 
 async fn capture_frame(page: &chromiumoxide::Page) -> Result<Vec<u8>, String> {
@@ -182,8 +256,9 @@ async fn render_screenshot(
     url: &Url,
     width: u32,
     height: u32,
+    delay_ms: u64,
 ) -> Result<Vec<u8>, String> {
-    let page = open_page(browser, url, width, height).await?;
+    let page = open_page(browser, url, width, height, delay_ms).await?;
     let png_data = capture_frame(&page).await?;
     let _ = page.close().await;
     Ok(png_data)
@@ -219,9 +294,11 @@ async fn render_url(
     if let Some(ref path) = cache_file {
         if let Some(data) = try_cache_read(path).await {
             info!("Cache hit for URL: {}", url);
+            let cache_header = format!("public, max-age={}", params.cache.unwrap_or(0));
             return Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "image/png")
+                .header(header::CACHE_CONTROL, cache_header)
                 .body(axum::body::Body::from(data))
                 .unwrap()
                 .into_response();
@@ -233,7 +310,9 @@ async fn render_url(
         url, params.w, params.h
     );
 
-    match render_screenshot(&state.browser, &url, params.w, params.h).await {
+    let delay_ms = params.delay.unwrap_or(0).min(30000);
+
+    match render_screenshot(&state.browser, &url, params.w, params.h, delay_ms).await {
         Ok(png_data) => {
             let total_time = start.elapsed();
             info!(
@@ -247,9 +326,15 @@ async fn render_url(
                 let _ = fs::write(path, &png_data).await;
             }
 
+            let cache_header = match params.cache {
+                Some(ttl) => format!("public, max-age={}", ttl),
+                None => "no-store".to_string(),
+            };
+
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "image/png")
+                .header(header::CACHE_CONTROL, cache_header)
                 .body(axum::body::Body::from(png_data))
                 .unwrap()
                 .into_response()
@@ -334,8 +419,9 @@ async fn render_animation(
     height: u32,
     duration: f32,
     fps: u32,
+    delay_ms: u64,
 ) -> Result<Vec<u8>, String> {
-    let page = open_page(browser, url, width, height).await?;
+    let page = open_page(browser, url, width, height, delay_ms).await?;
 
     let total_frames = (duration * fps as f32).ceil() as u32;
     let frame_interval = std::time::Duration::from_millis((1000 / fps) as u64);
@@ -401,9 +487,11 @@ async fn animate_url(
     if let Some(ref path) = cache_file {
         if let Some(data) = try_cache_read(path).await {
             info!("Cache hit for animation: {}", url);
+            let cache_header = format!("public, max-age={}", params.cache.unwrap_or(0));
             return Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "image/apng")
+                .header(header::CACHE_CONTROL, cache_header)
                 .body(axum::body::Body::from(data))
                 .unwrap()
                 .into_response();
@@ -415,7 +503,10 @@ async fn animate_url(
         url, params.w, params.h, duration, fps
     );
 
-    match render_animation(&state.browser, &url, params.w, params.h, duration, fps).await {
+    let delay_ms = params.delay.unwrap_or(0).min(30000);
+
+    match render_animation(&state.browser, &url, params.w, params.h, duration, fps, delay_ms).await
+    {
         Ok(apng_data) => {
             let total_time = start.elapsed();
             info!(
@@ -428,9 +519,15 @@ async fn animate_url(
                 let _ = fs::write(path, &apng_data).await;
             }
 
+            let cache_header = match params.cache {
+                Some(ttl) => format!("public, max-age={}", ttl),
+                None => "no-store".to_string(),
+            };
+
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "image/apng")
+                .header(header::CACHE_CONTROL, cache_header)
                 .body(axum::body::Body::from(apng_data))
                 .unwrap()
                 .into_response()
@@ -556,6 +653,7 @@ mod tests {
             h: 600,
             verify: Some(sig),
             cache: None,
+            delay: None,
         };
         assert!(verify_render_signature(&params, key).is_ok());
     }
@@ -568,6 +666,7 @@ mod tests {
             h: 600,
             verify: Some("bad-signature".to_string()),
             cache: None,
+            delay: None,
         };
         assert!(verify_render_signature(&params, "test-secret").is_err());
     }
@@ -580,6 +679,7 @@ mod tests {
             h: 600,
             verify: None,
             cache: None,
+            delay: None,
         };
         assert!(verify_render_signature(&params, "test-secret").is_err());
     }
